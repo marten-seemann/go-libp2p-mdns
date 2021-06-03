@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/libp2p/go-libp2p-core/peer"
 	ma "github.com/multiformats/go-multiaddr"
@@ -20,9 +19,44 @@ const (
 	mdnsDomain   = "local."
 )
 
-func extractIPs(addrs []ma.Multiaddr) ([]string, error) {
+type MDNSService struct {
+	id    peer.ID
+	addrs []ma.Multiaddr
+
+	// This ctx is passed to the resolver.
+	// It is closed when Close() is called.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	server *zeroconf.Server
+}
+
+func NewMDNSService(id peer.ID, addrs []ma.Multiaddr) *MDNSService {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &MDNSService{
+		ctx:       ctx,
+		ctxCancel: cancel,
+		id:        id,
+		addrs:     addrs,
+	}
+	s.startServer()
+	s.startResolver()
+	return s
+}
+
+func (s *MDNSService) Close() error {
+	s.ctxCancel()
+	if s.server != nil {
+		s.server.Shutdown()
+	}
+	return nil
+}
+
+// We don't really care about the IP addresses, but the spec (and various routers / firewalls) require us
+// to send A and AAAA records.
+func (s *MDNSService) getIPs() ([]string, error) {
 	var ip4, ip6 string
-	for _, addr := range addrs {
+	for _, addr := range s.addrs {
 		network, hostport, err := manet.DialArgs(addr)
 		if err != nil {
 			continue
@@ -50,14 +84,13 @@ func extractIPs(addrs []ma.Multiaddr) ([]string, error) {
 	return ips, nil
 }
 
-func StartServer(peerID peer.ID, addrs []ma.Multiaddr) error {
-	txts := make([]string, 0, len(addrs))
-	for _, addr := range addrs {
+func (s *MDNSService) startServer() error {
+	txts := make([]string, 0, len(s.addrs))
+	for _, addr := range s.addrs {
 		txts = append(txts, "/dnsaddr="+addr.String())
 	}
-	// We don't really care about the IP addresses, but the spec (and various routers / firewalls) require us
-	// to send A and AAAA records.
-	ips, err := extractIPs(addrs)
+
+	ips, err := s.getIPs()
 	if err != nil {
 		return err
 	}
@@ -67,7 +100,7 @@ func StartServer(peerID peer.ID, addrs []ma.Multiaddr) error {
 		mdnsService,
 		mdnsDomain,
 		4001,
-		peerID.Pretty(), // TODO: deals with peer IDs longer than 63 characters
+		s.id.Pretty(), // TODO: deals with peer IDs longer than 63 characters
 		ips,
 		txts,
 		nil,
@@ -75,12 +108,11 @@ func StartServer(peerID peer.ID, addrs []ma.Multiaddr) error {
 	if err != nil {
 		return err
 	}
-	defer server.Shutdown()
-	time.Sleep(10 * time.Second)
+	s.server = server
 	return nil
 }
 
-func StartClient() error {
+func (s *MDNSService) startResolver() error {
 	resolver, err := zeroconf.NewResolver()
 	if err != nil {
 		return err
@@ -99,9 +131,5 @@ func StartClient() error {
 			}
 		}
 	}()
-	if err := resolver.Lookup(context.Background(), mdnsInstance, mdnsService, mdnsDomain, entryChan); err != nil {
-		return err
-	}
-	time.Sleep(10 * time.Second)
-	return nil
+	return resolver.Lookup(s.ctx, mdnsInstance, mdnsService, mdnsDomain, entryChan)
 }
