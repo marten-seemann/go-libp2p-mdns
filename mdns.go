@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/libp2p/go-libp2p-core/peer"
 	ma "github.com/multiformats/go-multiaddr"
@@ -14,9 +15,10 @@ import (
 )
 
 const (
-	mdnsInstance = "_p2p"
-	mdnsService  = "_udp"
-	mdnsDomain   = "local."
+	mdnsInstance  = "_p2p"
+	mdnsService   = "_udp"
+	mdnsDomain    = "local."
+	dnsAddrPrefix = "dnsaddr="
 )
 
 type MDNSService struct {
@@ -87,7 +89,7 @@ func (s *MDNSService) getIPs() ([]string, error) {
 func (s *MDNSService) startServer() error {
 	txts := make([]string, 0, len(s.addrs))
 	for _, addr := range s.addrs {
-		txts = append(txts, "/dnsaddr="+addr.String())
+		txts = append(txts, dnsAddrPrefix+addr.String())
 	}
 
 	ips, err := s.getIPs()
@@ -121,14 +123,20 @@ func (s *MDNSService) startResolver() error {
 	entryChan := make(chan *zeroconf.ServiceEntry, 10)
 	go func() {
 		for entry := range entryChan {
-			fmt.Printf("received entry for %s: %#v\nIPv4:", entry.ServiceInstanceName(), entry)
-			for _, ip := range entry.AddrIPv4 {
-				fmt.Printf("\t%s\n", ip.String())
+			// We only care about the TXT records.
+			// Ignore A, AAAA and PTR.
+			addrs := make([]ma.Multiaddr, 0, len(entry.Text)) // assume that all TXT records are dnsaddrs
+			for _, s := range entry.Text {
+				if !strings.HasPrefix(s, dnsAddrPrefix) {
+					continue
+				}
+				addr, err := ma.NewMultiaddr(s[len(dnsAddrPrefix):])
+				if err != nil {
+					continue
+				}
+				addrs = append(addrs, addr)
 			}
-			fmt.Print("IPv6:")
-			for _, ip := range entry.AddrIPv6 {
-				fmt.Printf("\t%s\n", ip.String())
-			}
+			fmt.Printf("Received addrs: %v\n", addrs)
 		}
 	}()
 	return resolver.Lookup(s.ctx, mdnsInstance, mdnsService, mdnsDomain, entryChan)
